@@ -1,4 +1,11 @@
-python3 -c "import onnx; m=onnx.load('mymodel.onnx'); 
-print('Inputs:', [i.name for i in m.graph.input]); 
-print('Outputs:', [o.name for o in m.graph.output])"
+python3 - << 'EOF'
+import onnx
+model = onnx.load("your_model.onnx")
+print("INPUTS:")
+for i in model.graph.input:
+    print("  ", i.name)
+print("OUTPUTS:")
+for o in model.graph.output:
+    print("  ", o.name)
+EOF
 
