@@ -1,335 +1,388 @@
-#!/usr/bin/env python3
+# SPDX-FileCopyrightText: NVIDIA CORPORATION & AFFILIATES
+# Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
 
-import os
+from typing import Any, Dict
 
-from ament_index_python.packages import get_package_share_directory
+from isaac_ros_examples import IsaacROSLaunchFragment
 import launch
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
-from launch.conditions import IfCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
 
+# Expected number of input messages in 1 second
+INPUT_IMAGES_EXPECT_FREQ = 30
+# Number of input messages to be dropped in 1 second
+INPUT_IMAGES_DROP_FREQ = 28
 
-REALSENSE_IMAGE_WIDTH = 1280
-REALSENSE_IMAGE_HEIGHT = 720
-YOLOV8_MODEL_INPUT = 640
-REALSENSE_TO_YOLO_RATIO = REALSENSE_IMAGE_WIDTH / YOLOV8_MODEL_INPUT
+# YOLOv8 model expects 640x640 encoded image size (adjust if your model uses different size)
+YOLO_MODEL_INPUT_WIDTH = 640
+YOLO_MODEL_INPUT_HEIGHT = 640
+# YOLOv8 models expect 3 image channels
+YOLO_MODEL_NUM_CHANNELS = 3
+
 VISUALIZATION_DOWNSCALING_FACTOR = 10
 
-REFINE_MODEL_PATH = '/tmp/refine_model.onnx'
 REFINE_ENGINE_PATH = '/tmp/refine_trt_engine.plan'
-SCORE_MODEL_PATH = '/tmp/score_model.onnx'
 SCORE_ENGINE_PATH = '/tmp/score_trt_engine.plan'
 
 
+class IsaacROSFoundationPoseYoloLaunchFragment(IsaacROSLaunchFragment):
+
+    @staticmethod
+    def get_composable_nodes(interface_specs: Dict[str, Any]) -> Dict[str, ComposableNode]:
+
+        # Drop node parameters
+        input_images_expect_freq = LaunchConfiguration('input_images_expect_freq')
+        input_images_drop_freq = LaunchConfiguration('input_images_drop_freq')
+        # FoundationPose parameters
+        mesh_file_path = LaunchConfiguration('mesh_file_path')
+        texture_path = LaunchConfiguration('texture_path')
+        refine_engine_file_path = LaunchConfiguration('refine_engine_file_path')
+        score_engine_file_path = LaunchConfiguration('score_engine_file_path')
+        # YOLOv8 parameters
+        model_file_path = LaunchConfiguration('model_file_path')
+        engine_file_path = LaunchConfiguration('engine_file_path')
+        confidence_threshold = LaunchConfiguration('confidence_threshold')
+        nms_threshold = LaunchConfiguration('nms_threshold')
+        num_classes = LaunchConfiguration('num_classes')
+        
+        input_width = interface_specs['camera_resolution']['width']
+        input_height = interface_specs['camera_resolution']['height']
+        input_to_yolo_ratio = input_width / YOLO_MODEL_INPUT_WIDTH
+        
+        return {
+            # Drops input_images_expect_freq out of input_images_drop_freq input messages
+            'drop_node':  ComposableNode(
+                name='drop_node',
+                package='isaac_ros_nitros_topic_tools',
+                plugin='nvidia::isaac_ros::nitros::NitrosCameraDropNode',
+                parameters=[{
+                    'X': input_images_drop_freq,
+                    'Y': input_images_expect_freq,
+                    'mode': 'mono+depth',
+                    'depth_format_string': 'nitros_image_mono16'
+                }],
+                remappings=[
+                    ('image_1', 'image_rect'),
+                    ('camera_info_1', 'camera_info_rect'),
+                    ('depth_1', 'depth'),
+                    ('image_1_drop', 'rgb/image_rect_color'),
+                    ('camera_info_1_drop', 'rgb/camera_info'),
+                    ('depth_1_drop', 'depth_image'),
+                ]
+            ),
+
+            # ========== YOLOv8 PREPROCESSING PIPELINE ==========
+            # Resize and pad input images to YOLOv8 model input image size
+            'resize_left_yolo_node': ComposableNode(
+                name='resize_left_yolo_node',
+                package='isaac_ros_image_proc',
+                plugin='nvidia::isaac_ros::image_proc::ResizeNode',
+                parameters=[{
+                    'input_width': input_width,
+                    'input_height': input_height,
+                    'output_width': YOLO_MODEL_INPUT_WIDTH,
+                    'output_height': YOLO_MODEL_INPUT_HEIGHT,
+                    'keep_aspect_ratio': True,
+                    'encoding_desired': 'rgb8',
+                    'disable_padding': True
+                }],
+                remappings=[
+                    ('image', 'rgb/image_rect_color'),
+                    ('camera_info', 'rgb/camera_info'),
+                    ('resize/image', 'color_image_resized'),
+                    ('resize/camera_info', 'camera_info_resized')
+                ]
+            ),
+            
+            # Pad the image to exact YOLO input size (640x640)
+            'pad_node': ComposableNode(
+                name='pad_node',
+                package='isaac_ros_image_proc',
+                plugin='nvidia::isaac_ros::image_proc::PadNode',
+                parameters=[{
+                    'output_image_width': YOLO_MODEL_INPUT_WIDTH,
+                    'output_image_height': YOLO_MODEL_INPUT_HEIGHT,
+                    'padding_type': 'BOTTOM_RIGHT'
+                }],
+                remappings=[(
+                    'image', 'color_image_resized'
+                )]
+            ),
+
+            # Convert image to tensor
+            'image_to_tensor_node': ComposableNode(
+                name='image_to_tensor_node',
+                package='isaac_ros_tensor_proc',
+                plugin='nvidia::isaac_ros::dnn_inference::ImageToTensorNode',
+                parameters=[{
+                    'scale': False,
+                    'tensor_name': 'image',
+                }],
+                remappings=[
+                    ('image', 'padded_image'),
+                    ('tensor', 'normalized_tensor'),
+                ]
+            ),
+
+            # Convert from interleaved to planar format (HWC -> CHW)
+            'interleave_to_planar_node': ComposableNode(
+                name='interleaved_to_planar_node',
+                package='isaac_ros_tensor_proc',
+                plugin='nvidia::isaac_ros::dnn_inference::InterleavedToPlanarNode',
+                parameters=[{
+                    'input_tensor_shape': [YOLO_MODEL_INPUT_HEIGHT,
+                                           YOLO_MODEL_INPUT_WIDTH,
+                                           YOLO_MODEL_NUM_CHANNELS]
+                }],
+                remappings=[
+                    ('interleaved_tensor', 'normalized_tensor')
+                ]
+            ),
+
+            # Reshape tensor to add batch dimension [C, H, W] -> [1, C, H, W]
+            'reshape_node': ComposableNode(
+                name='reshape_node',
+                package='isaac_ros_tensor_proc',
+                plugin='nvidia::isaac_ros::dnn_inference::ReshapeNode',
+                parameters=[{
+                    'output_tensor_name': 'input_tensor',
+                    'input_tensor_shape': [YOLO_MODEL_NUM_CHANNELS,
+                                           YOLO_MODEL_INPUT_HEIGHT,
+                                           YOLO_MODEL_INPUT_WIDTH],
+                    'output_tensor_shape': [1, YOLO_MODEL_NUM_CHANNELS,
+                                            YOLO_MODEL_INPUT_HEIGHT,
+                                            YOLO_MODEL_INPUT_WIDTH]
+                }],
+                remappings=[
+                    ('tensor', 'planar_tensor')
+                ],
+            ),
+
+            # Normalize the tensor (YOLOv8 expects values in [0, 1] range)
+            'normalize_node': ComposableNode(
+                name='normalize_node',
+                package='isaac_ros_tensor_proc',
+                plugin='nvidia::isaac_ros::dnn_inference::NormalizeNode',
+                parameters=[{
+                    'mean': [0.0, 0.0, 0.0],
+                    'stddev': [255.0, 255.0, 255.0],
+                    'input_tensor_name': 'input_tensor',
+                }],
+                remappings=[
+                    ('tensor', 'reshaped_tensor'),
+                    ('normalized_tensor', 'normalized_input_tensor')
+                ]
+            ),
+
+            # ========== YOLOv8 INFERENCE ==========
+            # YOLOv8 TensorRT inference
+            'tensor_rt_node': ComposableNode(
+                name='tensor_rt_yolo',
+                package='isaac_ros_tensor_rt',
+                plugin='nvidia::isaac_ros::dnn_inference::TensorRTNode',
+                parameters=[{
+                    'model_file_path': model_file_path,
+                    'engine_file_path': engine_file_path,
+                    'output_binding_names': ['output_tensor'],
+                    'output_tensor_names': ['output_tensor'],
+                    'input_tensor_names': ['input_tensor'],
+                    'input_binding_names': ['input_tensor'],
+                    'force_engine_update': False
+                }],
+                remappings=[
+                    ('tensor_pub', 'tensor_sub'),
+                    ('tensor_sub', 'normalized_input_tensor')
+                ]
+            ),
+
+            # YOLOv8 decoder - converts raw tensor output to Detection2DArray
+            'yolov8_decoder_node': ComposableNode(
+                name='yolov8_decoder',
+                package='isaac_ros_yolov8',
+                plugin='nvidia::isaac_ros::yolov8::YoloV8DecoderNode',
+                parameters=[{
+                    'confidence_threshold': confidence_threshold,
+                    'nms_threshold': nms_threshold,
+                    'num_classes': num_classes,
+                    'tensor_name': 'output_tensor'
+                }],
+                remappings=[
+                    ('tensor_sub', 'tensor_pub')
+                ]
+            ),
+
+            # ========== DETECTION TO SEGMENTATION CONVERSION ==========
+            # Filter detections (optional - keeps only highest confidence detection)
+            'detection2_d_array_filter_node': ComposableNode(
+                name='detection2_d_array_filter',
+                package='isaac_ros_foundationpose',
+                plugin='nvidia::isaac_ros::foundationpose::Detection2DArrayFilter',
+                remappings=[('detection2_d_array', 'detections_output')]
+            ),
+            
+            # Convert Detection2DArray to binary segmentation mask
+            'detection2_d_to_mask_node': ComposableNode(
+                name='detection2_d_to_mask',
+                package='isaac_ros_foundationpose',
+                plugin='nvidia::isaac_ros::foundationpose::Detection2DToMask',
+                parameters=[{
+                    'mask_width': int(input_width/input_to_yolo_ratio),
+                    'mask_height': int(input_height/input_to_yolo_ratio)
+                }],
+                remappings=[('segmentation', 'yolo_segmentation')]
+            ),
+
+            # Resize segmentation mask to match input image size for FoundationPose
+            'resize_mask_node': ComposableNode(
+                name='resize_mask_node',
+                package='isaac_ros_image_proc',
+                plugin='nvidia::isaac_ros::image_proc::ResizeNode',
+                parameters=[{
+                    'input_width': int(input_width/input_to_yolo_ratio),
+                    'input_height': int(input_height/input_to_yolo_ratio),
+                    'output_width': input_width,
+                    'output_height': input_height,
+                    'keep_aspect_ratio': False,
+                    'disable_padding': False
+                }],
+                remappings=[
+                    ('image', 'yolo_segmentation'),
+                    ('camera_info', 'camera_info_resized'),
+                    ('resize/image', 'segmentation'),
+                    ('resize/camera_info', 'camera_info_segmentation')
+                ]
+            ),
+
+            # Resize image for visualization
+            'resize_left_viz': ComposableNode(
+                name='resize_left_viz',
+                package='isaac_ros_image_proc',
+                plugin='nvidia::isaac_ros::image_proc::ResizeNode',
+                parameters=[{
+                    'input_width': input_width,
+                    'input_height': input_height,
+                    'output_width': int(input_width/VISUALIZATION_DOWNSCALING_FACTOR) * 2,
+                    'output_height': int(input_height/VISUALIZATION_DOWNSCALING_FACTOR) * 2,
+                    'keep_aspect_ratio': False,
+                    'encoding_desired': 'rgb8',
+                    'disable_padding': False
+                }],
+                remappings=[
+                    ('image', 'rgb/image_rect_color'),
+                    ('camera_info', 'rgb/camera_info'),
+                    ('resize/image', 'rgb/image_rect_color_viz'),
+                    ('resize/camera_info', 'rgb/camera_info_viz')
+                ]
+            ),
+
+            # ========== FOUNDATIONPOSE NODE ==========
+            'foundationpose_node': ComposableNode(
+                name='foundationpose_node',
+                package='isaac_ros_foundationpose',
+                plugin='nvidia::isaac_ros::foundationpose::FoundationPoseNode',
+                parameters=[{
+                    'mesh_file_path': mesh_file_path,
+                    'texture_path': texture_path,
+
+                    'refine_engine_file_path': refine_engine_file_path,
+                    'refine_input_tensor_names': ['input_tensor1', 'input_tensor2'],
+                    'refine_input_binding_names': ['input1', 'input2'],
+                    'refine_output_tensor_names': ['output_tensor1', 'output_tensor2'],
+                    'refine_output_binding_names': ['output1', 'output2'],
+
+                    'score_engine_file_path': score_engine_file_path,
+                    'score_input_tensor_names': ['input_tensor1', 'input_tensor2'],
+                    'score_input_binding_names': ['input1', 'input2'],
+                    'score_output_tensor_names': ['output_tensor'],
+                    'score_output_binding_names': ['output1'],
+                }],
+                remappings=[
+                    ('pose_estimation/depth_image', 'depth_image'),
+                    ('pose_estimation/image', 'rgb/image_rect_color'),
+                    ('pose_estimation/camera_info', 'rgb/camera_info'),
+                    ('pose_estimation/segmentation', 'segmentation'),
+                    ('pose_estimation/output', 'output')]
+            ),
+        }
+
+    @staticmethod
+    def get_launch_actions(interface_specs: Dict[str, Any]) -> \
+            Dict[str, launch.actions.OpaqueFunction]:
+
+        return {
+            'input_images_expect_freq': DeclareLaunchArgument(
+                'input_images_expect_freq',
+                default_value=str(INPUT_IMAGES_EXPECT_FREQ),
+                description='Expected number of input messages in 1 second'),
+
+            'input_images_drop_freq': DeclareLaunchArgument(
+                'input_images_drop_freq',
+                default_value=str(INPUT_IMAGES_DROP_FREQ),
+                description='Number of input messages to be dropped in 1 second'),
+
+            'mesh_file_path': DeclareLaunchArgument(
+                'mesh_file_path',
+                default_value='',
+                description='The absolute file path to the mesh file'),
+
+            'texture_path': DeclareLaunchArgument(
+                'texture_path',
+                default_value='',
+                description='The absolute file path to the texture file'),
+
+            'refine_engine_file_path': DeclareLaunchArgument(
+                'refine_engine_file_path',
+                default_value=REFINE_ENGINE_PATH,
+                description='The absolute file path to the refine trt engine'),
+
+            'score_engine_file_path': DeclareLaunchArgument(
+                'score_engine_file_path',
+                default_value=SCORE_ENGINE_PATH,
+                description='The absolute file path to the score trt engine'),
+
+            'model_file_path': DeclareLaunchArgument(
+                'model_file_path',
+                default_value='',
+                description='The absolute file path to the YOLOv8 ONNX file'),
+
+            'engine_file_path': DeclareLaunchArgument(
+                'engine_file_path',
+                default_value='',
+                description='The absolute file path to the YOLOv8 TensorRT engine file'),
+
+            'confidence_threshold': DeclareLaunchArgument(
+                'confidence_threshold',
+                default_value='0.25',
+                description='Confidence threshold for YOLOv8 detections'),
+
+            'nms_threshold': DeclareLaunchArgument(
+                'nms_threshold',
+                default_value='0.45',
+                description='NMS threshold for YOLOv8 detections'),
+
+            'num_classes': DeclareLaunchArgument(
+                'num_classes',
+                default_value='1',
+                description='Number of classes in your custom YOLO model'),
+        }
+
+
 def generate_launch_description():
-    rviz_config_path = os.path.join(
-        get_package_share_directory('isaac_ros_foundationpose'),
-        'rviz', 'foundationpose_realsense.rviz')
-
-    # ----------------- Launch arguments -----------------
-    launch_args = [
-        DeclareLaunchArgument('mesh_file_path', default_value=''),
-        DeclareLaunchArgument('texture_path', default_value=''),
-
-        # refine / score model + engine
-        DeclareLaunchArgument('refine_model_file_path', default_value=REFINE_MODEL_PATH),
-        DeclareLaunchArgument('refine_engine_file_path', default_value=REFINE_ENGINE_PATH),
-        DeclareLaunchArgument('score_model_file_path', default_value=SCORE_MODEL_PATH),
-        DeclareLaunchArgument('score_engine_file_path', default_value=SCORE_ENGINE_PATH),
-
-        # YOLOv8 ONNX + TensorRT engine
-        DeclareLaunchArgument('yolov8_model_file_path', default_value=''),
-        DeclareLaunchArgument('yolov8_engine_file_path', default_value=''),
-
-        # *** VERY IMPORTANT: match your ONNX IO names ***
-        DeclareLaunchArgument('input_tensor_names',  default_value='["images"]'),
-        DeclareLaunchArgument('input_binding_names', default_value='["images"]'),
-        DeclareLaunchArgument('output_tensor_names',  default_value='["output0"]'),
-        DeclareLaunchArgument('output_binding_names', default_value='["output0"]'),
-
-        DeclareLaunchArgument('confidence_threshold', default_value='0.25'),
-        DeclareLaunchArgument('nms_threshold', default_value='0.45'),
-        DeclareLaunchArgument('num_classes', default_value='1'),   # your model has 1 class
-
-        DeclareLaunchArgument('launch_rviz', default_value='False'),
-        DeclareLaunchArgument('container_name', default_value='yolov8_foundationpose_container'),
-    ]
-
-    mesh_file_path = LaunchConfiguration('mesh_file_path')
-    texture_path = LaunchConfiguration('texture_path')
-    refine_model_file_path = LaunchConfiguration('refine_model_file_path')
-    refine_engine_file_path = LaunchConfiguration('refine_engine_file_path')
-    score_model_file_path = LaunchConfiguration('score_model_file_path')
-    score_engine_file_path = LaunchConfiguration('score_engine_file_path')
-
-    yolov8_model_file_path = LaunchConfiguration('yolov8_model_file_path')
-    yolov8_engine_file_path = LaunchConfiguration('yolov8_engine_file_path')
-    input_tensor_names = LaunchConfiguration('input_tensor_names')
-    input_binding_names = LaunchConfiguration('input_binding_names')
-    output_tensor_names = LaunchConfiguration('output_tensor_names')
-    output_binding_names = LaunchConfiguration('output_binding_names')
-    launch_rviz = LaunchConfiguration('launch_rviz')
-    container_name = LaunchConfiguration('container_name')
-
-    # ----------------- RealSense driver -----------------
-    realsense_config_file_path = os.path.join(
-        get_package_share_directory('isaac_ros_foundationpose'),
-        'config', 'realsense.yaml')
-    realsense_node = ComposableNode(
-        package='realsense2_camera',
-        plugin='realsense2_camera::RealSenseNodeFactory',
-        parameters=[realsense_config_file_path])
-
-    # Downsample RGB+depth, depth as mono16
-    drop_node = ComposableNode(
-        name='drop_node',
-        package='isaac_ros_nitros_topic_tools',
-        plugin='nvidia::isaac_ros::nitros::NitrosCameraDropNode',
-        parameters=[{
-            'X': 6,
-            'Y': 30,
-            'mode': 'mono+depth',
-            'depth_format_string': 'nitros_image_mono16'
-        }],
-        remappings=[
-            ('image_1', '/color/image_raw'),
-            ('camera_info_1', '/color/camera_info'),
-            ('depth_1', '/aligned_depth_to_color/image_raw'),
-            ('image_1_drop', 'rgb/image_rect_color'),
-            ('camera_info_1_drop', 'rgb/camera_info'),
-            ('depth_1_drop', 'depth_uint16'),
-        ])
-
-    # Convert Z16 → 32FC1 metric depth
-    convert_metric_node = ComposableNode(
-        package='isaac_ros_depth_image_proc',
-        plugin='nvidia::isaac_ros::depth_image_proc::ConvertMetricNode',
-        remappings=[
-            ('image_raw', 'depth_uint16'),
-            ('image', 'depth_image')
-        ])
-
-    # ----------------- YOLOv8 encoder (letterbox 1280x720 -> 640x640) -----------------
-    encoder_dir = get_package_share_directory('isaac_ros_dnn_image_encoder')
-    yolov8_encoder_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            [os.path.join(encoder_dir, 'launch', 'dnn_image_encoder.launch.py')]
-        ),
-        launch_arguments={
-            'input_image_width': str(REALSENSE_IMAGE_WIDTH),
-            'input_image_height': str(REALSENSE_IMAGE_HEIGHT),
-            'network_image_width': str(YOLOV8_MODEL_INPUT),
-            'network_image_height': str(YOLOV8_MODEL_INPUT),
-            'image_mean': '[0.0, 0.0, 0.0]',
-            'image_stddev': '[1.0, 1.0, 1.0]',
-            'attach_to_shared_component_container': 'True',
-            'component_container_name': container_name,
-            'dnn_image_encoder_namespace': 'yolov8_encoder',
-            'image_input_topic': 'rgb/image_rect_color',
-            'camera_info_input_topic': 'rgb/camera_info',
-            'tensor_output_topic': '/tensor_pub',
-            'keep_aspect_ratio': 'True',
-        }.items()
+    return launch.LaunchDescription(
+        list(IsaacROSFoundationPoseYoloLaunchFragment.get_launch_actions({}).values())
     )
-
-    # ----------------- YOLOv8 TensorRT inference -----------------
-    tensor_rt_node = ComposableNode(
-        name='yolov8_tensor_rt',
-        package='isaac_ros_tensor_rt',
-        plugin='nvidia::isaac_ros::dnn_inference::TensorRTNode',
-        parameters=[{
-            'model_file_path': yolov8_model_file_path,
-            'engine_file_path': yolov8_engine_file_path,
-            'input_tensor_names': input_tensor_names,
-            'input_binding_names': input_binding_names,
-            'output_tensor_names': output_tensor_names,
-            'output_binding_names': output_binding_names,
-            'verbose': False,
-            'force_engine_update': False,
-            'relaxed_dimension_check': True,
-            'max_batch_size': 1,
-        }],
-        remappings=[
-            ('tensor_input', '/tensor_pub')   # from encoder
-        ])
-
-    # ----------------- YOLOv8 decoder -----------------
-    yolov8_decoder_node = ComposableNode(
-        name='yolov8_decoder',
-        package='isaac_ros_yolov8',
-        plugin='nvidia::isaac_ros::yolov8::YoloV8DecoderNode',
-        parameters=[{
-            'confidence_threshold': LaunchConfiguration('confidence_threshold'),
-            'nms_threshold': LaunchConfiguration('nms_threshold'),
-            'num_classes': LaunchConfiguration('num_classes'),
-            # MUST MATCH YOUR OUTPUT TENSOR NAME
-            'tensor_name': 'output0',
-        }])
-
-    # ----------------- Detection → segmentation mask (640x640) -----------------
-    detection2_d_to_mask_node = ComposableNode(
-        name='detection2_d_to_mask',
-        package='isaac_ros_foundationpose',
-        plugin='nvidia::isaac_ros::foundationpose::Detection2DToMask',
-        parameters=[{
-            'mask_width': YOLOV8_MODEL_INPUT,
-            'mask_height': YOLOV8_MODEL_INPUT,
-        }],
-        remappings=[
-            ('detection2_d_array', 'detections_output'),
-            ('segmentation', 'yolov8_segmentation_small')
-        ])
-
-    # ----------------- Remove letterbox padding (640x640 -> 640x360) -----------------
-    pad_vertical = int(
-        (YOLOV8_MODEL_INPUT -
-         int(REALSENSE_IMAGE_HEIGHT / REALSENSE_TO_YOLO_RATIO)) / 2
-    )
-    unletterbox_mask_node = ComposableNode(
-        name='unletterbox_mask',
-        package='isaac_ros_image_proc',
-        plugin='nvidia::isaac_ros::image_proc::CropNode',
-        parameters=[{
-            'input_width': YOLOV8_MODEL_INPUT,
-            'input_height': YOLOV8_MODEL_INPUT,
-            'crop_width': int(REALSENSE_IMAGE_WIDTH / REALSENSE_TO_YOLO_RATIO),
-            'crop_height': int(REALSENSE_IMAGE_HEIGHT / REALSENSE_TO_YOLO_RATIO),
-            'roi_top_left_x': 0,
-            'roi_top_left_y': pad_vertical,
-            'crop_mode': 'BBOX',
-            'encoding_desired': 'mono8',
-        }],
-        remappings=[
-            ('image', 'yolov8_segmentation_small'),
-            ('camera_info', 'yolov8_encoder/resize/camera_info'),
-            ('crop/image', 'yolov8_segmentation_small_unpadded'),
-            ('crop/camera_info', 'yolov8_encoder/resize/camera_info')
-        ])
-
-    # ----------------- Resize mask back to 1280x720 -----------------
-    resize_mask_node = ComposableNode(
-        name='resize_mask_node',
-        package='isaac_ros_image_proc',
-        plugin='nvidia::isaac_ros::image_proc::ResizeNode',
-        parameters=[{
-            'input_width': int(REALSENSE_IMAGE_WIDTH / REALSENSE_TO_YOLO_RATIO),
-            'input_height': int(REALSENSE_IMAGE_HEIGHT / REALSENSE_TO_YOLO_RATIO),
-            'output_width': REALSENSE_IMAGE_WIDTH,
-            'output_height': REALSENSE_IMAGE_HEIGHT,
-            'keep_aspect_ratio': False,
-            'disable_padding': False,
-            'encoding_desired': 'mono8',
-        }],
-        remappings=[
-            ('image', 'yolov8_segmentation_small_unpadded'),
-            ('camera_info', 'yolov8_encoder/resize/camera_info'),
-            ('resize/image', 'segmentation'),
-            ('resize/camera_info', 'camera_info_segmentation')
-        ])
-
-    # ----------------- Selector → feeds FoundationPose -----------------
-    selector_node = ComposableNode(
-        name='selector_node',
-        package='isaac_ros_foundationpose',
-        plugin='nvidia::isaac_ros::foundationpose::Selector',
-        parameters=[{'reset_period': 10000}],
-        remappings=[
-            ('depth_image', 'depth_image'),
-            ('image', 'rgb/image_rect_color'),
-            ('camera_info', 'rgb/camera_info'),
-            ('segmentation', 'segmentation')
-        ])
-
-    # ----------------- FoundationPose nodes (refine + score) -----------------
-    foundationpose_node = ComposableNode(
-        name='foundationpose_node',
-        package='isaac_ros_foundationpose',
-        plugin='nvidia::isaac_ros::foundationpose::FoundationPoseNode',
-        parameters=[{
-            'mesh_file_path': mesh_file_path,
-            'texture_path': texture_path,
-
-            'refine_model_file_path': refine_model_file_path,
-            'refine_engine_file_path': refine_engine_file_path,
-            'refine_input_tensor_names': ['input_tensor1', 'input_tensor2'],
-            'refine_input_binding_names': ['input1', 'input2'],
-            'refine_output_tensor_names': ['output_tensor1', 'output_tensor2'],
-            'refine_output_binding_names': ['output1', 'output2'],
-
-            'score_model_file_path': score_model_file_path,
-            'score_engine_file_path': score_engine_file_path,
-            'score_input_tensor_names': ['input_tensor1', 'input_tensor2'],
-            'score_input_binding_names': ['input1', 'input2'],
-            'score_output_tensor_names': ['output_tensor'],
-            'score_output_binding_names': ['output1'],
-        }])
-
-    foundationpose_tracking_node = ComposableNode(
-        name='foundationpose_tracking_node',
-        package='isaac_ros_foundationpose',
-        plugin='nvidia::isaac_ros::foundationpose::FoundationPoseTrackingNode',
-        parameters=[{
-            'mesh_file_path': mesh_file_path,
-            'texture_path': texture_path,
-            'refine_model_file_path': refine_model_file_path,
-            'refine_engine_file_path': refine_engine_file_path,
-            'refine_input_tensor_names': ['input_tensor1', 'input_tensor2'],
-            'refine_input_binding_names': ['input1', 'input2'],
-            'refine_output_tensor_names': ['output_tensor1', 'output_tensor2'],
-            'refine_output_binding_names': ['output1', 'output2'],
-        }])
-
-    # ----------------- Visualization RGB downscale -----------------
-    resize_left_viz = ComposableNode(
-        name='resize_left_viz',
-        package='isaac_ros_image_proc',
-        plugin='nvidia::isaac_ros::image_proc::ResizeNode',
-        parameters=[{
-            'input_width': REALSENSE_IMAGE_WIDTH,
-            'input_height': REALSENSE_IMAGE_HEIGHT,
-            'output_width': int(REALSENSE_IMAGE_WIDTH / VISUALIZATION_DOWNSCALING_FACTOR),
-            'output_height': int(REALSENSE_IMAGE_HEIGHT / VISUALIZATION_DOWNSCALING_FACTOR),
-            'keep_aspect_ratio': False,
-            'encoding_desired': 'rgb8',
-            'disable_padding': False,
-        }],
-        remappings=[
-            ('image', 'rgb/image_rect_color'),
-            ('camera_info', 'rgb/camera_info'),
-            ('resize/image', 'rgb/image_rect_color_viz'),
-            ('resize/camera_info', 'rgb/camera_info_viz')
-        ])
-
-    rviz_node = Node(
-        package='rviz2',
-        executable='rviz2',
-        name='rviz2',
-        arguments=['-d', rviz_config_path],
-        condition=IfCondition(launch_rviz)
-    )
-
-    container = ComposableNodeContainer(
-        name=container_name,
-        namespace='',
-        package='rclcpp_components',
-        executable='component_container_mt',
-        composable_node_descriptions=[
-            realsense_node,
-            drop_node,
-            convert_metric_node,
-            tensor_rt_node,
-            yolov8_decoder_node,
-            detection2_d_to_mask_node,
-            unletterbox_mask_node,
-            resize_mask_node,
-            selector_node,
-            foundationpose_node,
-            foundationpose_tracking_node,
-            resize_left_viz,
-        ],
-        output='screen')
-
-    return launch.LaunchDescription(launch_args + [container, yolov8_encoder_launch, rviz_node])
