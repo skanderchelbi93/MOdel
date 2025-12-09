@@ -90,14 +90,24 @@ class IsaacROSFoundationPoseLaunchFragment(IsaacROSLaunchFragment):
             # --------------------------
             # 2. Convert depth → metric
             # --------------------------
-            'convert_metric_node': ComposableNode(
+            'convert_depth_to_16u_node': ComposableNode(
+                name='convert_depth_to_16u',
                 package='isaac_ros_depth_image_proc',
-                plugin='nvidia::isaac_ros::depth_image_proc::ConvertMetricNode',
+                plugin='nvidia::isaac_ros::depth_image_proc::ConvertDepthTo16UNode',
                 remappings=[
-                    ('image_raw', 'depth_image_drop'),
-                    ('image', 'depth_image')
+                    ('image', 'depth_image_drop'),
+                    ('image_16u', 'depth_image_16u')
                 ]
-            ),
+            )
+
+           'convert_metric_node': ComposableNode(
+            package='isaac_ros_depth_image_proc',
+            plugin='nvidia::isaac_ros::depth_image_proc::ConvertMetricNode',
+            remappings=[
+                ('image_raw', 'depth_image_16u'),
+                ('image', 'depth_image')
+            ])
+
 
             # --------------------------
             # 3. YOLO TensorRT inferencing
