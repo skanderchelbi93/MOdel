@@ -1,0 +1,19 @@
+'depth_alias_node': ComposableNode(
+    name='depth_alias_node',
+    package='isaac_ros_nitros',
+    plugin='nvidia::isaac_ros::nitros::NitrosImageRelayNode',
+    remappings=[
+        ('image', 'depth_image'),   # INPUT
+        ('image_relay', '/depth')   # OUTPUT
+    ]
+),
+
+'depth_image_alias_node': ComposableNode(
+    name='depth_image_alias_node',
+    package='isaac_ros_nitros',
+    plugin='nvidia::isaac_ros::nitros::NitrosImageRelayNode',
+    remappings=[
+        ('image', 'depth_image'),       # INPUT
+        ('image_relay', '/depth_image') # OUTPUT
+    ]
+),
