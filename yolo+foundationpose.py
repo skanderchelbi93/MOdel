@@ -41,8 +41,9 @@ RT_DETR_MODEL_NUM_CHANNELS = 3
 YOLOV8_MODEL_INPUT_SIZE = 640
 
 VISUALIZATION_DOWNSCALING_FACTOR = 10
-
+REFINE_MODEL_PATH = '/tmp/refine_model.onnx'
 REFINE_ENGINE_PATH = '/tmp/refine_trt_engine.plan'
+SCORE_MODEL_PATH = '/tmp/score_model.onnx'
 SCORE_ENGINE_PATH = '/tmp/score_trt_engine.plan'
 
 
